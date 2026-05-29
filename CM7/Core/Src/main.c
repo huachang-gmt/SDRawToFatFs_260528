@@ -70,11 +70,18 @@ SD_HandleTypeDef hsd1;
 
 #define CHUNKS_PER_FILE       64    // 生成 約 1.7MB 大小的檔案，檔案內容資料有 32768 筆資料
 
-#define MAX_FILES_TO_GENERATE 20   // 控制： 最多生成幾個檔案 方便測試。  2026-05-28 15:05:58 測試通過
+#define MAX_FILES_TO_GENERATE 5   // 控制： 最多生成幾個檔案 方便測試。  5 -> 產生5個檔案
+
+#define PAYLOAD_SIZE        54
+
+#define PAYLOAD_BUFFER_SIZE \
+    (RECORD_COUNT * PAYLOAD_SIZE)
+
+#define RECORD_COUNT   (BUFFER_SIZE_BYTES / sizeof(log_record_t))
 
 typedef struct
 {
-    uint8_t payload[54];
+    uint8_t payload[PAYLOAD_SIZE];
 
     uint16_t tail;
 
@@ -84,15 +91,28 @@ typedef struct
 
 } log_record_t;
 
-#define RECORD_COUNT   (BUFFER_SIZE_BYTES / sizeof(log_record_t))
-
 FIL MyFile;
 
 __attribute__((section(".RAM_D1")))
 __attribute__((aligned(32)))
 log_record_t read_buffer[RECORD_COUNT];
 
+/*
+--------------------------------------------------
+高速 FATFS write buffer
+512 records × 54 bytes
+= 27648 bytes
+--------------------------------------------------
+*/
+__attribute__((section(".RAM_D1")))
+__attribute__((aligned(32)))
+uint8_t payload_buffer[PAYLOAD_BUFFER_SIZE];
+
 uint32_t current_sector;
+
+volatile uint8_t sd_read_done = 0;
+volatile uint8_t sd_read_error = 0;
+
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -142,6 +162,10 @@ void GenerateFatFsFile(uint32_t file_id)
     char filename[64];
 
     uint32_t chunk;
+	
+	uint32_t i;
+
+    uint32_t payload_offset;
 
     current_sector =
         START_SECTOR +
@@ -151,78 +175,104 @@ void GenerateFatFsFile(uint32_t file_id)
             "LOG%04lu.TXT",
             file_id);
 
+    
+    //PA6 HIGH 開始量測：  Raw Data -> FATFS 檔案生成總時間    
+    HAL_GPIO_WritePin(GPIOA,
+                      GPIO_PIN_6,
+                      GPIO_PIN_SET);
+
+    
+
+    // 建立 FATFS 檔案
     if(f_open(&MyFile,
               filename,
               FA_CREATE_ALWAYS | FA_WRITE) != FR_OK)
     {
-        BSP_LED_On(LED_YELLOW);
+        BSP_LED_On(LED_RED);
         while(1);
-        //Error_Handler();
     }
-    // 下方可移除，減少製檔時間
-    BSP_LED_On(LED_YELLOW);
-    HAL_Delay(1000);
-    BSP_LED_Off(LED_YELLOW);
 
-    for(chunk = 0; chunk < CHUNKS_PER_FILE; chunk++)    
+    // 開始讀取 Raw Data
+    for(chunk = 0; chunk < CHUNKS_PER_FILE; chunk++)
     {
-        if(HAL_SD_ReadBlocks(&hsd1,
-                             (uint8_t*)read_buffer,
-                             current_sector,
-                             SD_BLOCK_COUNT,
-                             HAL_MAX_DELAY) != HAL_OK)
+        //DMA Read 32KB
+        sd_read_done = 0;
+        sd_read_error = 0;
+
+        if(HAL_SD_ReadBlocks_DMA(&hsd1,
+                                (uint8_t*)read_buffer,
+                                current_sector,
+                                SD_BLOCK_COUNT) != HAL_OK)
         {
             BSP_LED_On(LED_RED);
-            BSP_LED_On(LED_YELLOW);
             while(1);
-            //Error_Handler();
         }
-        
 
+        //等待 DMA 完成
+        while(sd_read_done == 0)
+        {
+            if(sd_read_error)
+            {
+                BSP_LED_On(LED_RED);
+
+                while(1);
+            }
+            BSP_LED_On(LED_YELLOW);
+        }
+        BSP_LED_Off(LED_YELLOW);
+
+        while(HAL_SD_GetCardState(&hsd1) != HAL_SD_CARD_TRANSFER)
+        {
+          BSP_LED_On(LED_GREEN);
+        }
+        BSP_LED_Off(LED_GREEN);// 綠燈不亮，表示 Raw Data 很快讀取完成
+       
+        // D-Cache invalidate
         SCB_InvalidateDCache_by_Addr(
             (uint32_t*)read_buffer,
             BUFFER_SIZE_BYTES
         );
-
-        if(ValidateChunk() == 0)
+		
+		if(ValidateChunk() == 0)
         {
             break;
         }
+		
+		payload_offset = 0;
 
-        for(uint32_t i = 0; i < RECORD_COUNT; i++)
+        for(i = 0; i < RECORD_COUNT; i++)
         {
-            if(f_write(&MyFile,
-                      read_buffer[i].payload,
-                      sizeof(read_buffer[i].payload),
-                      &bw) != FR_OK)
-            {
-                BSP_LED_On(LED_GREEN);
-                BSP_LED_On(LED_YELLOW);
-                while(1);
-                //Error_Handler();
-            }
-        }
-        // 下方可移除，減少製檔時間
-        if((chunk % 2) == 0)
-        {
-            HAL_GPIO_TogglePin(GPIOA, GPIO_PIN_6);
-        }
+            memcpy(&payload_buffer[payload_offset],
+                   read_buffer[i].payload,
+                   PAYLOAD_SIZE);
 
+            payload_offset += PAYLOAD_SIZE;
+        }		
+          
+        if(f_write(&MyFile,
+                  payload_buffer,
+                  payload_offset,
+                  &bw) != FR_OK)
+        {
+            BSP_LED_On(LED_RED);
+            while(1);
+        }        
+
+        // 下一段 Raw Sector
         current_sector += SD_BLOCK_COUNT;
     }
 
+    //關閉檔案
     f_close(&MyFile);
 
-    // 下方可移除，減少製檔時間
-    BSP_LED_On(LED_YELLOW);
-    BSP_LED_On(LED_GREEN);
-    BSP_LED_On(LED_RED);
-    HAL_Delay(3000);
-    BSP_LED_Off(LED_YELLOW);
-    BSP_LED_Off(LED_GREEN);
-    BSP_LED_Off(LED_RED);
+    // PA6 LOW   檔案完成
+    HAL_GPIO_WritePin(GPIOA,
+                      GPIO_PIN_6,
+                      GPIO_PIN_RESET);
 
+    
 }
+
 
 /* USER CODE END 0 */
 
@@ -357,15 +407,18 @@ Error_Handler();
         while(1);
         Error_Handler();
     }
+    /*
     // mount 成功綠燈亮 1 秒
     BSP_LED_On(LED_GREEN);
     HAL_Delay(1000);
     BSP_LED_Off(LED_GREEN);
+    */
 
     for(file_id = 0; file_id < MAX_FILES_TO_GENERATE; file_id++)  // 想要生成幾個1.7MB檔案，檔案內容資料有 32768 筆資料，修改 MAX_FILES_TO_GENERATE 數值即可
     {
         GenerateFatFsFile(file_id);
 
+        /*
         HAL_GPIO_WritePin(GPIOA,
                       GPIO_PIN_6,
                       GPIO_PIN_SET);
@@ -378,14 +431,17 @@ Error_Handler();
 
         HAL_Delay(50);
         // 每生成一個 TXT： PA6 pulse 一次。
+        */
     }
    
 
     while(1)
     {
+      /*
         HAL_GPIO_TogglePin(GPIOA, GPIO_PIN_6);
 
         HAL_Delay(30);
+      */
     }
     /* USER CODE END WHILE */
 
@@ -478,7 +534,10 @@ static void MX_SDMMC1_SD_Init(void)
     Error_Handler();
   }
   /* USER CODE BEGIN SDMMC1_Init 2 */
-
+  if (HAL_SD_ConfigWideBusOperation(&hsd1, SDMMC_BUS_WIDE_4B) != HAL_OK)
+  {
+      Error_Handler();
+  }
   /* USER CODE END SDMMC1_Init 2 */
 
 }
@@ -547,7 +606,7 @@ void MPU_Config(void)
   MPU_InitStruct.Enable = MPU_REGION_ENABLE;
   MPU_InitStruct.Number = MPU_REGION_NUMBER0;
   MPU_InitStruct.BaseAddress = 0x24000000;
-  MPU_InitStruct.Size = MPU_REGION_SIZE_64KB;
+  MPU_InitStruct.Size = MPU_REGION_SIZE_256KB;
   MPU_InitStruct.SubRegionDisable = 0x0;
   MPU_InitStruct.TypeExtField = MPU_TEX_LEVEL0;
   MPU_InitStruct.AccessPermission = MPU_REGION_FULL_ACCESS;
